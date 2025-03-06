@@ -29,9 +29,12 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <time.h>
+#include <pthread.h>
+#include <fcntl.h>
 
 /* poll CQ timeout in millisec (2 seconds) */
-#define MAX_POLL_CQ_TIMEOUT 4000
+#define MAX_POLL_CQ_TIMEOUT 100000
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
@@ -90,8 +93,9 @@ struct resources
     struct ibv_qp *qp;                  /* QP handle */
     struct ibv_mr *mr;                  /* MR handle for buf */
     char *buf;                          /* memory buffer pointer, used for RDMA and send ops */
-    int sock;                           /* TCP socket file descriptor */
-};
+    };
+
+int qp_init_sock = -1, qp_sync_sock = -1, qp_finish_sock = -1;
 
 struct config_t config =
 {
@@ -379,16 +383,16 @@ static int post_send(struct resources *res, int opcode)
         switch(opcode)
         {
         case IBV_WR_SEND:
-            //fprintf(stdout, "Send Request was posted\n");
+            fprintf(stdout, "Send Request was posted\n");
             break;
         case IBV_WR_RDMA_READ:
             //fprintf(stdout, "RDMA Read Request was posted\n");
             break;
         case IBV_WR_RDMA_WRITE:
-            //fprintf(stdout, "RDMA Write Request was posted\n");
+            fprintf(stdout, "RDMA Write Request was posted\n");
             break;
         default:
-            //fprintf(stdout, "Unknown Request was posted\n");
+            fprintf(stdout, "Unknown Request was posted\n");
             break;
         }
     }
@@ -436,7 +440,7 @@ static int post_receive(struct resources *res)
     }
     else
     {
-        fprintf(stdout, "Receive Request was posted\n");
+        //fprintf(stdout, "Receive Request was posted\n");
     }
     return rc;
 }
@@ -455,8 +459,38 @@ static int post_receive(struct resources *res)
 ******************************************************************************/
 static void resources_init(struct resources *res)
 {
-    memset(res, 0, sizeof *res);
-    res->sock = -1;
+    memset(res, 0, sizeof(struct resources));
+}
+
+static int init_sock(){
+    int rc = 0;
+    
+    /* if client side */
+    if(config.server_name)
+    {
+        qp_init_sock = sock_connect(config.server_name, config.tcp_port);
+        if(qp_init_sock < 0)
+        {
+            fprintf(stderr, "failed to establish TCP connection to server %s, port %d\n",
+                    config.server_name, config.tcp_port);
+        }
+        sleep(1);
+        qp_sync_sock = sock_connect(config.server_name, config.tcp_port + 1);
+        if(qp_sync_sock < 0)
+        {
+            fprintf(stderr, "failed to establish TCP connection to server %s, port %d\n",
+                    config.server_name, config.tcp_port + 1);
+        }
+        sleep(1);
+        qp_finish_sock = sock_connect(config.server_name, config.tcp_port + 2);
+        if(qp_finish_sock < 0)
+        {
+            fprintf(stderr, "failed to establish TCP connection to server %s, port %d\n",
+                    config.server_name, config.tcp_port + 2);
+        }
+    }
+
+    return rc;
 }
 
 /******************************************************************************
@@ -484,33 +518,6 @@ static int resources_create(struct resources *res)
     int num_devices;
     int rc = 0;
 
-    /* if client side */
-    if(config.server_name)
-    {
-        res->sock = sock_connect(config.server_name, config.tcp_port);
-        if(res->sock < 0)
-        {
-            fprintf(stderr, "failed to establish TCP connection to server %s, port %d\n",
-                    config.server_name, config.tcp_port);
-            rc = -1;
-            goto resources_create_exit;
-        }
-    }
-    else
-    {
-        fprintf(stdout, "waiting on port %d for TCP connection\n", config.tcp_port);
-        res->sock = sock_connect(NULL, config.tcp_port);
-        if(res->sock < 0)
-        {
-            fprintf(stderr, "failed to establish TCP connection with client on port %d\n",
-                    config.tcp_port);
-            rc = -1;
-            goto resources_create_exit;
-        }
-    }
-    fprintf(stdout, "TCP connection was established\n");
-    fprintf(stdout, "searching for IB devices in host\n");
-
     /* get device names in the system */
     dev_list = ibv_get_device_list(&num_devices);
     if(!dev_list)
@@ -527,7 +534,7 @@ static int resources_create(struct resources *res)
         rc = 1;
         goto resources_create_exit;
     }
-    fprintf(stdout, "found %d device(s)\n", num_devices);
+    //fprintf(stdout, "found %d device(s)\n", num_devices);
 
     /* search for the specific device we want to work with */
     for(i = 0; i < num_devices; i ++)
@@ -625,8 +632,8 @@ static int resources_create(struct resources *res)
         rc = 1;
         goto resources_create_exit;
     }
-    fprintf(stdout, "MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x\n",
-            res->buf, res->mr->lkey, res->mr->rkey, mr_flags);
+    // fprintf(stdout, "MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x\n",
+    //         res->buf, res->mr->lkey, res->mr->rkey, mr_flags);
 
     /* create the Queue Pair */
     memset(&qp_init_attr, 0, sizeof(qp_init_attr));
@@ -645,7 +652,7 @@ static int resources_create(struct resources *res)
         rc = 1;
         goto resources_create_exit;
     }
-    fprintf(stdout, "QP was created, QP number=0x%x\n", res->qp->qp_num);
+    //fprintf(stdout, "QP was created, QP number=0x%x\n", res->qp->qp_num);
 
 resources_create_exit:
     if(rc)
@@ -685,14 +692,6 @@ resources_create_exit:
         {
             ibv_free_device_list(dev_list);
             dev_list = NULL;
-        }
-        if(res->sock >= 0)
-        {
-            if(close(res->sock))
-            {
-                fprintf(stderr, "failed to close socket\n");
-            }
-            res->sock = -1;
         }
     }
     return rc;
@@ -859,8 +858,8 @@ static int connect_qp(struct resources *res)
     local_con_data.qp_num = htonl(res->qp->qp_num);
     local_con_data.lid = htons(res->port_attr.lid);
     memcpy(local_con_data.gid, &my_gid, 16);
-    fprintf(stdout, "\nLocal LID = 0x%x\n", res->port_attr.lid);
-    if(sock_sync_data(res->sock, sizeof(struct cm_con_data_t), (char *) &local_con_data, (char *) &tmp_con_data) < 0)
+    //fprintf(stdout, "\nLocal LID = 0x%x\n", res->port_attr.lid);
+    if(sock_sync_data(qp_init_sock, sizeof(struct cm_con_data_t), (char *) &local_con_data, (char *) &tmp_con_data) < 0)
     {
         fprintf(stderr, "failed to exchange connection data between sides\n");
         rc = 1;
@@ -875,15 +874,15 @@ static int connect_qp(struct resources *res)
 
     /* save the remote side attributes, we will need it for the post SR */
     res->remote_props = remote_con_data;
-    fprintf(stdout, "Remote address = 0x%"PRIx64"\n", remote_con_data.addr);
-    fprintf(stdout, "Remote rkey = 0x%x\n", remote_con_data.rkey);
-    fprintf(stdout, "Remote QP number = 0x%x\n", remote_con_data.qp_num);
-    fprintf(stdout, "Remote LID = 0x%x\n", remote_con_data.lid);
+    // fprintf(stdout, "Remote address = 0x%"PRIx64"\n", remote_con_data.addr);
+    // fprintf(stdout, "Remote rkey = 0x%x\n", remote_con_data.rkey);
+    // fprintf(stdout, "Remote QP number = 0x%x\n", remote_con_data.qp_num);
+    // fprintf(stdout, "Remote LID = 0x%x\n", remote_con_data.lid);
     if(config.gid_idx >= 0)
     {
-        uint8_t *p = remote_con_data.gid;
-        fprintf(stdout, "Remote GID = %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
-				p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+        //uint8_t *p = remote_con_data.gid;
+        // fprintf(stdout, "Remote GID = %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
+		// 		p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
     }
 
     /* modify the QP to init */
@@ -919,10 +918,10 @@ static int connect_qp(struct resources *res)
         fprintf(stderr, "failed to modify QP state to RTS\n");
         goto connect_qp_exit;
     }
-    fprintf(stdout, "QP state was change to RTS\n");
+    //fprintf(stdout, "QP state was change to RTS\n");
 
     /* sync to make sure that both sides are in states that they can connect to prevent packet loose */
-    if(sock_sync_data(res->sock, 1, "Q", &temp_char))  /* just send a dummy char back and forth */
+    if(sock_sync_data(qp_sync_sock, 1, "Q", &temp_char))  /* just send a dummy char back and forth */
     {
         fprintf(stderr, "sync error after QPs are were moved to RTS\n");
         rc = 1;
@@ -949,7 +948,7 @@ static int resources_destroy(struct resources *res)
     int rc = 0;
     if(res->qp)
 	{
-        if(ibv_destroy_qp(res->qp))
+                if(ibv_destroy_qp(res->qp))
         {
             fprintf(stderr, "failed to destroy QP\n");
             rc = 1;
@@ -996,16 +995,53 @@ static int resources_destroy(struct resources *res)
             rc = 1;
         }
 	}
+    free(res);
+    return rc;
+}
 
-    if(res->sock >= 0)
+//关闭总sock
+static int close_sock(){
+    int rc = 0;
+    
+    if(close(qp_init_sock))
 	{
-        if(close(res->sock))
+        fprintf(stderr, "failed to close socket\n");
+        rc = 1;
+    }
+
+    if(close(qp_sync_sock))
         {
             fprintf(stderr, "failed to close socket\n");
             rc = 1;
         }
+
+    if(close(qp_finish_sock))
+    {
+        fprintf(stderr, "failed to close socket\n");
+        rc = 1;
 	}
+
     return rc;
+}
+struct ibv_qp_attr attr;
+struct ibv_qp_init_attr init_attr;
+
+int check_qp_connection(struct resources *res) {
+    // 查询 QP 状态
+    int ret = ibv_query_qp(res->qp, &attr, IBV_QP_STATE, &init_attr);
+    if (ret != 0) {
+        perror("ibv_query_qp failed");
+        return -1;
+    }
+
+    // 检查 QP 状态
+    if (attr.qp_state == IBV_QPS_ERR) {
+        printf("QP is in error state.\n");
+        return -1; // 表示连接中断或有错误发生
+    } else {
+        printf("QP is operational and not in error state.\n");
+        return 0; // 表示连接正常
+    }
 }
 
 /******************************************************************************
@@ -1076,6 +1112,47 @@ void writeCharToFile(const char* filename, const char* content) {
     fclose(file);
 }
 
+void set_nonblocking(int sockfd) {
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("获取文件状态标志失败");
+        return;
+    }
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("设置非阻塞模式失败");
+    }
+}
+
+//-1: 出错 0: 没有新数据 1: 有新数据
+int poll_socket(int sockfd, char* char_ret) {
+    int bytesRead = read(sockfd, char_ret, 1); // 尝试读取 1 字节的数据
+    if (bytesRead == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        perror("读取数据时出错");
+        return -1;
+    }else if (bytesRead == 0) {
+        // 连接被对方关闭，或者没有数据可读
+        printf("no data");
+        return 0;
+    }
+    //printf("get char: %c", *char_ret);
+    return 1;
+}
+
+int send_char_to_socket(int sockfd, char ch) {
+    // 发送单个字符
+    int bytesSent = send(sockfd, &ch, sizeof(ch), 0);
+    
+    if (bytesSent < 0) {
+        // 处理错误
+        perror("send error");
+    }
+    
+    return bytesSent;
+}
+
 
 /******************************************************************************
 * Function: main
@@ -1090,12 +1167,96 @@ void writeCharToFile(const char* filename, const char* content) {
 *
 * Description: Main program code
 ******************************************************************************/
+
+
+
+//QP池
+struct resources *res_pool[10];
+
+//线程锁
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int should_wait[10]; // 标记每个线程是否需要等待
+} ControlBlock;
+
+ControlBlock control;
+
+
+pthread_t threads[10];
+int thread_ids[10];
+
+
+void wait_n_nanoseconds(long nanoseconds) {
+    struct timespec ts;
+    ts.tv_sec = 0; // 秒部分
+    ts.tv_nsec = nanoseconds; // 转换为纳秒
+    nanosleep(&ts, NULL); // 如果被信号中断，第二个参数可用于剩余时间
+}
+
+void* handle_qp_read(void* arg){
+    int qp_index = *((int*) arg);
+    printf("qp %d线程准备好\n",qp_index);
+    //开始读取
+    while(1){
+        //阻塞线程。外部控制其释放
+        pthread_mutex_lock(&control.mutex);
+        while(control.should_wait[qp_index]) {
+            pthread_cond_wait(&control.cond, &control.mutex); // 阻塞当前线程
+        }
+        pthread_mutex_unlock(&control.mutex);
+        //printf("qp %d线程工作\n",qp_index);
+        for(int i=qp_index;i<10;i+=2){   
+            if(post_send(res_pool[i], IBV_WR_RDMA_READ))
+            {
+                fprintf(stderr, "failed to post SR 2\n");
+            }
+            if(poll_completion(res_pool[i]))
+            {
+                fprintf(stderr, "poll completion failed 2, id: %d\n",i);
+            }
+        }
+        send_char_to_socket(qp_finish_sock, qp_index + '0');
+        control.should_wait[qp_index] = 1;//加锁，等待下一个
+    }
+    return NULL;
+}
+
+
+
+void init_control_block(ControlBlock *cb) {
+    pthread_mutex_init(&cb->mutex, NULL);
+    pthread_cond_init(&cb->cond, NULL);
+    for(int i = 0; i < 2; ++i) {
+        cb->should_wait[i] = 1; // 默认所有线程都需要等待
+    }
+}
+
+void init_threads(){
+    init_control_block(&control);
+    for(int i = 0; i < 2; ++i) {
+        thread_ids[i] = i;
+        if(pthread_create(&threads[i], NULL, handle_qp_read, (void*)&thread_ids[i]) != 0) {
+            perror("Failed to create thread");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+void release_thread(int thread_id) {
+    pthread_mutex_lock(&control.mutex);
+    control.should_wait[thread_id] = 0; // 设置为不等待
+    pthread_cond_signal(&control.cond); // 发送信号给对应的线程
+    pthread_mutex_unlock(&control.mutex);
+}
+
+
+
 int main(int argc, char *argv[])
 {
-    struct resources res;
+    pid_t pid = getpid(); // 获取当前进程号
+    printf("Current process ID: %d\n", pid); // 打印当前进程号
     int rc = 1;
-    char temp_char;
-
     /* parse the command line parameters */
     while(1)
     {
@@ -1163,140 +1324,66 @@ int main(int argc, char *argv[])
 
     /* print the used parameters for info*/
     print_config();
-    /* init all of the resources, so cleanup will be easy */
-    resources_init(&res);
-    /* create resources before using them */
-    if(resources_create(&res))
-    {
-        fprintf(stderr, "failed to create resources\n");
+    if(init_sock()){
+        fprintf(stderr, "init sock failed\n");
         goto main_exit;
     }
-    /* connect the QPs */
-    if(connect_qp(&res))
-    {
-        fprintf(stderr, "failed to connect QPs\n");
-        goto main_exit;
+    
+    //初始化qp
+    for(int i=0;i<10;i++){
+        res_pool[i] = (struct resources*) malloc(sizeof(struct resources));
+        resources_init(res_pool[i]);
+        if(resources_create(res_pool[i]))
+        {
+            fprintf(stderr, "failed to create resources\n");
+            goto main_exit;
+        }
+         /* connect the QPs */
+        if(connect_qp(res_pool[i]))
+        {
+            fprintf(stderr, "failed to connect QPs\n");
+            goto main_exit;
+        }
     }
 
-    // for(int i=1;i<=1;i++){
-    //     if(poll_completion(&res))
-    //     {
-    //         fprintf(stderr, "poll completion failed\n");
-    //         goto main_exit;
-    //     }
-    //     fprintf(stdout, "Message is: '%s'\n", res.buf);
-    //     //接收成功，处理数据
-    //     if(i==100){
-    //         break;
-    //     }
-    //     rc = post_receive(&res);
-    //     if(rc)
-    //     {
-    //         fprintf(stderr, "failed to post RR\n");
-    //     }
-    // }
-    
-    /* after polling the completion we have the message in the client buffer too */
+    //socket设置为非阻塞
+    set_nonblocking(qp_finish_sock);
+    //初始化线程池
+    init_threads();
 
-    
+    char temp_char;
 
-    /* Sync so we are sure server side has data ready before client tries to read it */
-
-    //开始读取
     while(1){
-        if(sock_sync_data(res.sock, 1, "R", &temp_char))  /* just send a dummy char back and forth */
-        {
-            fprintf(stderr, "sync error before RDMA ops\n");
-            rc = 1;
-            goto main_exit;
-        }
-        //putchar(temp_char);
-        if(post_send(&res, IBV_WR_RDMA_READ))
-        {
-            fprintf(stderr, "failed to post SR 2\n");
-            rc = 1;
-            goto main_exit;
-        }
-        if(poll_completion(&res))
-        {
-            fprintf(stderr, "poll completion failed 2\n");
-            rc = 1;
-            goto main_exit;
-        }
-        //writeCharToFile("file.txt", res.buf);
-        
-        if(temp_char=='R'){
-            //完成
-            break;
-        }else if(temp_char=='r'){
-            //继续
+        int ret = poll_socket(qp_finish_sock, &temp_char);
+        if(ret == 0){
+            continue;
+        }else if(ret == -1){
+            break;//错误
+        }else{
+            if(temp_char == 'F'){
+                break;
+                //发送结束
+            }
+            //printf("get char: %c\n", temp_char);
+            int qp_index = temp_char - '0';
             
+            //这时:释放线程，进行传输
+            release_thread(qp_index);
+            //流切片等待
+            wait_n_nanoseconds(100000);
         }
     }
-    // if(sock_sync_data(res.sock, 1, "R", &temp_char))  /* just send a dummy char back and forth */
-    // {
-    //     fprintf(stderr, "sync error before RDMA ops\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-
-
-    // /* 
-	//  * Now the client performs an RDMA read and then write on server.
-	//  * Note that the server has no idea these events have occured 
-	//  */
-
-    // /* First we read contens of server's buffer */
-    // if(post_send(&res, IBV_WR_RDMA_READ))
-    // {
-    //     fprintf(stderr, "failed to post SR 2\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-    // if(poll_completion(&res))
-    // {
-    //     fprintf(stderr, "poll completion failed 2\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-    // fprintf(stdout, "Contents of server's buffer: '%s'\n", res.buf);
-
-    // /* Now we replace what's in the server's buffer */
-    // strcpy(res.buf, RDMAMSGW);
-    // fprintf(stdout, "Now replacing it with: '%s'\n", res.buf);
-    // if(post_send(&res, IBV_WR_RDMA_WRITE))
-    // {
-    //     fprintf(stderr, "failed to post SR 3\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-    // if(poll_completion(&res))
-    // {
-    //     fprintf(stderr, "poll completion failed 3\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-
-
-    // /* Sync so server will know that client is done mucking with its memory */
-    // if(sock_sync_data(res.sock, 1, "W", &temp_char))  /* just send a dummy char back and forth */
-    // {
-    //     fprintf(stderr, "sync error after RDMA ops\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-
+    //等待数据全部传输完
+    sleep(2);
     rc = 0;
 
 main_exit:
-    if(resources_destroy(&res))
-    {
-        fprintf(stderr, "failed to destroy resources\n");
-        rc = 1;
-    }
     if(config.dev_name)
     {
         free((char *) config.dev_name);
+    }
+    if(close_sock()){
+        fprintf(stderr, "failed to close global sock\n");
     }
     fprintf(stdout, "\ntest result is %d\n", rc);
     return rc;

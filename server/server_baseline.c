@@ -30,12 +30,13 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
+
 /* poll CQ timeout in millisec (2 seconds) */
-#define MAX_POLL_CQ_TIMEOUT 4000
+#define MAX_POLL_CQ_TIMEOUT 10000
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
-#define MSG_SIZE 1024 * 64
+#define MSG_SIZE 1024 * 128
 //128K缓存
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 static inline uint64_t htonll(uint64_t x)
@@ -1063,6 +1064,13 @@ static void usage(const char *argv0)
     fprintf(stdout, " -g, --gid_idx <git index> gid index to be used in GRH (default not used)\n");
 }
 
+void generate_data_to_buf(char *buffer){
+    for(int i = 0;i < MSG_SIZE - 1;i++){
+        buffer[i] = 'f';
+    }
+    buffer[MSG_SIZE - 1] = '\0';
+}
+
 // 修改后的函数：从文件的指定偏移量开始读取数据到指定的缓冲区
 int read_file_to_char(char* buffer, const char* filename, long offset, size_t chunk_size) {
     // 打开文件
@@ -1099,7 +1107,7 @@ int read_file_to_char(char* buffer, const char* filename, long offset, size_t ch
     // 关闭文件
     fclose(file);
 
-    printf("成功从偏移量%ld处读取了%zu字节的数据。\n", offset, bytesRead);
+    //printf("成功从偏移量%ld处读取了%zu字节的数据。\n", offset, bytesRead);
 
     // 如果读取的字节数少于请求的chunk_size，说明已经到达文件末尾
     if (bytesRead < chunk_size) {
@@ -1195,6 +1203,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+
+    struct timeval start, end;
+    long mtime, seconds, useconds;
+
     /* print the used parameters for info*/
     print_config();
     /* init all of the resources, so cleanup will be easy */
@@ -1211,20 +1223,28 @@ int main(int argc, char *argv[])
         fprintf(stderr, "failed to connect QPs\n");
         goto main_exit;
     }
+    gettimeofday(&start, NULL); // 获取开始时间
     //开始断点传输文件
-    int data_size = MSG_SIZE - 1;
-    long offset = 0;
+
+
+    long long total_data_size = (long long)10 * 1024 * 1024 * 1024;
+
+    long long data_size = MSG_SIZE;
+    long long offset = 0;
+    int count = 0;
     while(1){
-        //读取缓存到文件中
-        int read_result = read_file_to_char(res.buf, "file.txt", offset, data_size);
-        if(read_result == -1){
-            //发生错误
-            break;
+        ++count;
+        if(count%10000==0){
+            count%=10000;
+            printf("%.2lf\n",(double)offset/(double)total_data_size);
         }
+        //读取缓存到文件中
+        generate_data_to_buf(res.buf);
+        //int read_result = read_file_to_char(res.buf, "file_final.txt", offset, data_size);
         offset += data_size;
         
         //通知客户端读取
-        if(read_result == 0){
+        if(offset >= total_data_size){
             //本次发送完之后已经读取完毕
             if(sock_sync_data(res.sock, 1, "R", &temp_char))  /* just send a dummy char back and forth */
             {
@@ -1243,50 +1263,14 @@ int main(int argc, char *argv[])
             }
         }
     }
+    // 在这里放置你想要计时的代码
 
+    gettimeofday(&end, NULL); // 获取结束时间
+    seconds = end.tv_sec - start.tv_sec;
+    useconds = end.tv_usec - start.tv_usec;
+    mtime = ((seconds) * 1000 + useconds / 1000.0) + 0.5;
 
-    
-    // for(int i=1;i<=1;i++){
-    //     /* let the server post the sr */
-    //     char buffer[10];
-    //     sprintf(buffer, "id: %d", i);
-    //     strcpy(res.buf, buffer);
-        
-    //     if(post_send(&res, IBV_WR_SEND))
-    //     {
-    //         fprintf(stderr, "failed to post sr\n");
-    //         goto main_exit;
-    //     }
-      
-    //     /* in both sides we expect to get a completion */
-    //     if(poll_completion(&res))
-    //     {
-    //         fprintf(stderr, "poll completion failed\n");
-    //         goto main_exit;
-    //     }
-    // }
-    /* after polling the completion we have the message in the client buffer too */
-    //strcpy(res.buf, RDMAMSGR);
-    
-
-    /* Sync so we are sure server side has data ready before client tries to read it */
-    // if(sock_sync_data(res.sock, 1, "R", &temp_char))  /* just send a dummy char back and forth */
-    // {
-    //     fprintf(stderr, "sync error before RDMA ops\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-
-
-    // /* Sync so server will know that client is done mucking with its memory */
-    // if(sock_sync_data(res.sock, 1, "W", &temp_char))  /* just send a dummy char back and forth */
-    // {
-    //     fprintf(stderr, "sync error after RDMA ops\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-    // fprintf(stdout, "Contents of server buffer: '%s'\n", res.buf);
-
+    printf("Elapsed time: %ld milliseconds\n", mtime);
     rc = 0;
 
 main_exit:
