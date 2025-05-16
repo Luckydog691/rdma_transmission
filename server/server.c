@@ -1157,11 +1157,17 @@ int read_file_to_char(char* buffer, const char* filename, long offset, size_t ch
     }
 }
 
+int flag=0;
+
 void generate_data_to_buf(char *buffer){
-    for(int i = 0;i < MSG_SIZE - 1;i++){
-        buffer[i] = 'f';
+    if(flag<=10){
+        for(int i = 0;i < MSG_SIZE - 1;i++){
+            buffer[i] = 'f';
+        }
+        buffer[MSG_SIZE - 1] = '\0';
+        ++flag;
     }
-    buffer[MSG_SIZE - 1] = '\0';
+    
 }
 
 //用于查询哪个QP空闲
@@ -1169,10 +1175,13 @@ int qp_viable[10]={0};
 //QP池
 struct resources *res_pool[10];
 
+int qp_ready = 3; //有多少个空闲的QP 
+
 //每次从socket里面读取一个字符，定期轮询
 //读取的字符：说明该QP数据已经被读完，可以换碟
 
 //-1: 出错 0: 没有新数据 1: 有新数据
+int count[10]={0};
 void poll_socket(int sockfd) {
     char char_ret;
     
@@ -1186,10 +1195,31 @@ void poll_socket(int sockfd) {
         // 连接被对方关闭，或者没有数据可读
         return;
     }
-    //printf("get char: %c", char_ret);
+    if(char_ret<'0' || char_ret>'9'){
+        printf("get char: %c %d\n", char_ret, char_ret);
+    }else{
+        ++count[char_ret - '0'];
+        if(count[char_ret - '0']%10000==0){
+            printf("bin: %d %d %d\n",count[0],count[1],count[2]);
+        }
+    }
+    
     //释放对应的QP
     qp_viable[char_ret - '0'] = 0;
+    ++qp_ready;
 }
+
+
+//线程，阻塞TCP连接，等待释放QP资源
+void* handle_qp_finished(void* arg){
+    //开始读取
+    while(1){
+        //阻塞线程。外部控制其释放
+        poll_socket(qp_finish_sock);
+    }
+    return NULL;
+}
+
 
 void set_nonblocking(int sockfd) {
     int flags = fcntl(sockfd, F_GETFL, 0);
@@ -1295,13 +1325,22 @@ int main(int argc, char *argv[])
         goto main_exit;
     }
 
-    //socket设置为非阻塞
-    set_nonblocking(qp_finish_sock);
+    //子线程，不断从socket里读取信息
+    // pthread_t threads;
+    // int thread_ids;
+
+    // //socket设置为非阻塞
+    // //set_nonblocking(qp_finish_sock);
+    // if(pthread_create(&threads, NULL, handle_qp_finished, (void*)&thread_ids) != 0) {
+    //     perror("Failed to create thread");
+    //     exit(EXIT_FAILURE);
+    // }
 
 
     struct timeval start, end;
     long mtime, seconds, useconds;
     
+    // long long total_data_size = (long long)50 * 1024 * 1024 * 1024;
     long long total_data_size = (long long)50 * 1024 * 1024 * 1024;
 
     long long data_size = MSG_SIZE;
@@ -1310,7 +1349,7 @@ int main(int argc, char *argv[])
     //char temp_char;
     gettimeofday(&start, NULL); // 获取开始时间
 
-    for(int i=0;i<10;i++){
+    for(int i=0;i<3;i++){
         res_pool[i] = (struct resources*) malloc(sizeof(struct resources));
         resources_init(res_pool[i]);
         if(resources_create(res_pool[i]))
@@ -1325,43 +1364,42 @@ int main(int argc, char *argv[])
         }
     }
     printf("开始传输\n");
+
+    
     while(1){
-        //查看是否有QP被释放
-        poll_socket(qp_finish_sock);
-        
-        //查找空闲的QP
-        int qp_selected = -1;
-        for(int i=0;i<2;i++){
-            if(qp_viable[i] == 0){
-                qp_selected = i;
-                qp_viable[i] = 1;
+        if(qp_ready>0){
+            //有空闲qp
+            int qp_selected = -1;
+            for(int i=0;i<3;i++){
+                if(qp_viable[i] == 0){
+                    qp_selected = i;
+                    qp_viable[i] = 1;
+                    --qp_ready;
+                    break;
+                    
+                }
+            }
+            ++count;
+            if(count%10000==0){
+                count%=10000;
+                printf("%.2lf\n",(double)offset/(double)total_data_size);
+            }
+
+            //读取缓存到文件中
+            generate_data_to_buf(res_pool[qp_selected]->buf);
+            offset += data_size;
+            
+            //通知客户端读取
+            send_char_to_socket(qp_finish_sock, '0' + qp_selected);
+            //printf("%d\n",qp_selected);
+            if(offset >= total_data_size){
+                //本次发送完之后已经读取完毕
+                send_char_to_socket(qp_finish_sock, 'F');
                 break;
             }
-        }
-        if(qp_selected == -1){
-            continue;
-        }
-
-        ++count;
-        if(count%10000==0){
-            count%=10000;
-            printf("%.2lf\n",(double)offset/(double)total_data_size);
-        }
-
-        //读取缓存到文件中
-        for(int i=qp_selected;i<10;i+=2){
-            generate_data_to_buf(res_pool[i]->buf);
-            offset += data_size;
-        }
-        //generate_data_to_buf(res_pool[qp_selected]->buf);
-        //offset += data_size;
-        //通知客户端读取
-        send_char_to_socket(qp_finish_sock, '0' + qp_selected);
-
-        if(offset >= total_data_size){
-            //本次发送完之后已经读取完毕
-            send_char_to_socket(qp_finish_sock, 'F');
-            break;
+        }else{
+            //等待释放qp
+            poll_socket(qp_finish_sock);
         }
     }
     gettimeofday(&end, NULL); // 获取结束时间

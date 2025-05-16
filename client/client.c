@@ -15,6 +15,7 @@
 *
 *****************************************************************************/
 #include <stdio.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,6 +33,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <sys/eventfd.h>
 
 /* poll CQ timeout in millisec (2 seconds) */
 #define MAX_POLL_CQ_TIMEOUT 100000
@@ -92,8 +94,9 @@ struct resources
     struct ibv_cq *cq;                  /* CQ handle */
     struct ibv_qp *qp;                  /* QP handle */
     struct ibv_mr *mr;                  /* MR handle for buf */
+    struct ibv_comp_channel *comp_channel; //完成事件通道
     char *buf;                          /* memory buffer pointer, used for RDMA and send ops */
-    };
+};
 
 int qp_init_sock = -1, qp_sync_sock = -1, qp_finish_sock = -1;
 
@@ -286,50 +289,35 @@ End of socket operations
 * poll the queue until MAX_POLL_CQ_TIMEOUT milliseconds have passed.
 *
 ******************************************************************************/
-static int poll_completion(struct resources *res)
+static inline int poll_completion(struct resources *res)
 {
     struct ibv_wc wc;
-    unsigned long start_time_msec;
-    unsigned long cur_time_msec;
-    struct timeval cur_time;
-    int poll_result;
-    int rc = 0;
-    /* poll the completion for a while before giving up of doing it .. */
-    gettimeofday(&cur_time, NULL);
-    start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-    do
-    {
-        poll_result = ibv_poll_cq(res->cq, 1, &wc);
-        gettimeofday(&cur_time, NULL);
-        cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+    struct ibv_cq *ev_cq;
+    void *ev_ctx;
+    // 等待CQ上的事件发生
+    if (ibv_get_cq_event(res->comp_channel, &ev_cq, &ev_ctx)) {
+        // 在生产环境中，可能需要更优雅的错误处理方式
+        return 1;
     }
-    while((poll_result == 0) && ((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+    // 确认收到的CQ事件，避免内存泄漏
+    ibv_ack_cq_events(ev_cq, 1);
 
-    if(poll_result < 0)
-    {
-        /* poll CQ failed */
-        fprintf(stderr, "poll CQ failed\n");
-        rc = 1;
-    }
-    else if(poll_result == 0)
-    {
-        /* the CQ is empty */
-        fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
-        rc = 1;
-    }
-    else
-    {
-        /* CQE found */
-        //fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
-        /* check the completion status (here we don't care about the completion opcode */
-        if(wc.status != IBV_WC_SUCCESS)
-        {
-            fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", 
-					wc.status, wc.vendor_err);
-            rc = 1;
+    // 轮询CQ以获取工作完成状态
+    int poll_result = ibv_poll_cq(res->cq, 1, &wc);
+    if (poll_result < 0) {
+        // Poll CQ failed
+        return 1;
+    } else if (poll_result == 0) {
+        // Theoretically shouldn't happen after getting a CQ event
+        return 1;
+    } else {
+        // Check the completion status
+        if (wc.status != IBV_WC_SUCCESS) {
+            return 1;
         }
     }
-    return rc;
+
+    return 0; // Success
 }
 
 /******************************************************************************
@@ -591,9 +579,17 @@ static int resources_create(struct resources *res)
         goto resources_create_exit;
     }
 
+    // 创建完成事件通道
+    res->comp_channel = ibv_create_comp_channel(res->ib_ctx);
+    if (!res->comp_channel) {
+        fprintf(stderr, "Failed to create completion event channel\n");
+        // 错误处理
+        return -1;
+    }
+
     /* each side will send only one WR, so Completion Queue with 1 entry is enough */
     cq_size = 1;
-    res->cq = ibv_create_cq(res->ib_ctx, cq_size, NULL, NULL, 0);
+    res->cq = ibv_create_cq(res->ib_ctx, cq_size, NULL, res->comp_channel, 0);
     if(!res->cq)
     {
         fprintf(stderr, "failed to create CQ with %u entries\n", cq_size);
@@ -1026,6 +1022,20 @@ static int close_sock(){
 struct ibv_qp_attr attr;
 struct ibv_qp_init_attr init_attr;
 
+#define QP_COUNT 3 // 假设有3个QP conut
+
+int event_fds[QP_COUNT];
+
+void init_event_fds() {
+    for(int i = 0; i < QP_COUNT; ++i) {
+        event_fds[i] = eventfd(0, EFD_NONBLOCK); // 初始化为非阻塞模式
+        if (event_fds[i] == -1) {
+            perror("eventfd");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
 int check_qp_connection(struct resources *res) {
     // 查询 QP 状态
     int ret = ibv_query_qp(res->qp, &attr, IBV_QP_STATE, &init_attr);
@@ -1133,15 +1143,13 @@ int poll_socket(int sockfd, char* char_ret) {
         perror("读取数据时出错");
         return -1;
     }else if (bytesRead == 0) {
-        // 连接被对方关闭，或者没有数据可读
-        printf("no data");
         return 0;
     }
-    //printf("get char: %c", *char_ret);
     return 1;
 }
 
 int send_char_to_socket(int sockfd, char ch) {
+    
     // 发送单个字符
     int bytesSent = send(sockfd, &ch, sizeof(ch), 0);
     
@@ -1196,61 +1204,65 @@ void wait_n_nanoseconds(long nanoseconds) {
 
 void* handle_qp_read(void* arg){
     int qp_index = *((int*) arg);
-    printf("qp %d线程准备好\n",qp_index);
-    //开始读取
+    printf("qp %d线程准备好\n", qp_index);
+
+    uint64_t u;
+    int sleep_ti = 0;
+
     while(1){
-        //阻塞线程。外部控制其释放
-        pthread_mutex_lock(&control.mutex);
-        while(control.should_wait[qp_index]) {
-            pthread_cond_wait(&control.cond, &control.mutex); // 阻塞当前线程
-        }
-        pthread_mutex_unlock(&control.mutex);
-        //printf("qp %d线程工作\n",qp_index);
-        for(int i=qp_index;i<10;i+=2){   
-            if(post_send(res_pool[i], IBV_WR_RDMA_READ))
-            {
+        ssize_t s = read(event_fds[qp_index], &u, sizeof(uint64_t)); // 非阻塞读取
+        if (s == sizeof(uint64_t)) {
+            sleep_ti = 0;
+            // 执行RDMA读取操作
+            if (ibv_req_notify_cq(res_pool[qp_index]->cq, 0)) {
+                fprintf(stderr, "Couldn't request CQ notification\n");
+                return NULL;
+            }
+            if(post_send(res_pool[qp_index], IBV_WR_RDMA_READ)){
                 fprintf(stderr, "failed to post SR 2\n");
             }
-            if(poll_completion(res_pool[i]))
-            {
-                fprintf(stderr, "poll completion failed 2, id: %d\n",i);
+            if(poll_completion(res_pool[qp_index])){
+                fprintf(stderr, "poll completion failed 2, id: %d\n", qp_index);
+            }
+
+            send_char_to_socket(qp_finish_sock, qp_index + '0');
+        } else if (s == -1 && errno != EAGAIN) { // 处理错误
+            perror("read error");
+            return NULL;
+        }else{
+            // 等待一段时间再进行下一次轮询
+            if(sleep_ti==0){
+                usleep(200);
+                sleep_ti = 1;
+            }else{
+                usleep(20);
             }
         }
-        send_char_to_socket(qp_finish_sock, qp_index + '0');
-        control.should_wait[qp_index] = 1;//加锁，等待下一个
+         // 每隔500毫秒检查一次
     }
     return NULL;
 }
 
 
-
-void init_control_block(ControlBlock *cb) {
-    pthread_mutex_init(&cb->mutex, NULL);
-    pthread_cond_init(&cb->cond, NULL);
-    for(int i = 0; i < 2; ++i) {
-        cb->should_wait[i] = 1; // 默认所有线程都需要等待
-    }
-}
-
 void init_threads(){
-    init_control_block(&control);
-    for(int i = 0; i < 2; ++i) {
+    printf("init_threads\n"); // 打印当前进程号
+    for(int i = 0; i < 3; ++i) {
         thread_ids[i] = i;
         if(pthread_create(&threads[i], NULL, handle_qp_read, (void*)&thread_ids[i]) != 0) {
             perror("Failed to create thread");
             exit(EXIT_FAILURE);
         }
     }
+     printf("init_threads done\n"); // 打印当前进程号
 }
 
-void release_thread(int thread_id) {
-    pthread_mutex_lock(&control.mutex);
-    control.should_wait[thread_id] = 0; // 设置为不等待
-    pthread_cond_signal(&control.cond); // 发送信号给对应的线程
-    pthread_mutex_unlock(&control.mutex);
+void release_thread(int qp_index) {
+    uint64_t u = 1;
+    ssize_t s = write(event_fds[qp_index], &u, sizeof(uint64_t));
+    if (s != sizeof(uint64_t)) {
+        perror("write");
+    }
 }
-
-
 
 int main(int argc, char *argv[])
 {
@@ -1330,7 +1342,7 @@ int main(int argc, char *argv[])
     }
     
     //初始化qp
-    for(int i=0;i<10;i++){
+    for(int i=0;i<3;i++){
         res_pool[i] = (struct resources*) malloc(sizeof(struct resources));
         resources_init(res_pool[i]);
         if(resources_create(res_pool[i]))
@@ -1347,31 +1359,29 @@ int main(int argc, char *argv[])
     }
 
     //socket设置为非阻塞
-    set_nonblocking(qp_finish_sock);
+    //set_nonblocking(qp_finish_sock);
     //初始化线程池
+    init_event_fds();
     init_threads();
+    
 
     char temp_char;
 
     while(1){
-        int ret = poll_socket(qp_finish_sock, &temp_char);
-        if(ret == 0){
-            continue;
-        }else if(ret == -1){
-            break;//错误
-        }else{
-            if(temp_char == 'F'){
-                break;
-                //发送结束
-            }
-            //printf("get char: %c\n", temp_char);
-            int qp_index = temp_char - '0';
-            
-            //这时:释放线程，进行传输
-            release_thread(qp_index);
-            //流切片等待
-            wait_n_nanoseconds(100000);
+        poll_socket(qp_finish_sock, &temp_char);
+        if(temp_char == 'F'){
+            break;
+            //发送结束
         }
+        //
+        int qp_index = temp_char - '0';
+        //这时:释放线程，进行传输
+        // if(qp_index==0){
+        //     printf("get char: %c\n", temp_char);
+        // }
+        release_thread(qp_index);
+        //流切片等待
+        wait_n_nanoseconds(100);
     }
     //等待数据全部传输完
     sleep(2);

@@ -35,7 +35,7 @@
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
-#define MSG_SIZE 1024 * 128
+#define MSG_SIZE 128 * 1024
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 static inline uint64_t htonll(uint64_t x)
 {
@@ -89,6 +89,7 @@ struct resources
     struct ibv_cq *cq;                  /* CQ handle */
     struct ibv_qp *qp;                  /* QP handle */
     struct ibv_mr *mr;                  /* MR handle for buf */
+    struct ibv_comp_channel *comp_channel; //完成事件通道
     char *buf;                          /* memory buffer pointer, used for RDMA and send ops */
     int sock;                           /* TCP socket file descriptor */
 };
@@ -262,72 +263,37 @@ int sock_sync_data(int sock, int xfer_size, char *local_data, char *remote_data)
     }
     return rc;
 }
-/******************************************************************************
-End of socket operations
-******************************************************************************/
 
-/* poll_completion */
-/******************************************************************************
-* Function: poll_completion
-*
-* Input:
-* res: pointer to resources structure
-*
-* Output: none
-*
-* Returns: 0 on success, 1 on failure
-*
-* Description:
-* Poll the completion queue for a single event. This function will continue to
-* poll the queue until MAX_POLL_CQ_TIMEOUT milliseconds have passed.
-*
-******************************************************************************/
-static int poll_completion(struct resources *res)
+static inline int poll_completion(struct resources *res)
 {
     struct ibv_wc wc;
-    unsigned long start_time_msec;
-    unsigned long cur_time_msec;
-    struct timeval cur_time;
-    int poll_result;
-    int rc = 0;
-    /* poll the completion for a while before giving up of doing it .. */
-    gettimeofday(&cur_time, NULL);
-    start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-    do
-    {
-        poll_result = ibv_poll_cq(res->cq, 1, &wc);
-        gettimeofday(&cur_time, NULL);
-        cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+    struct ibv_cq *ev_cq;
+    void *ev_ctx;
+    // 等待CQ上的事件发生
+    if (ibv_get_cq_event(res->comp_channel, &ev_cq, &ev_ctx)) {
+        // 在生产环境中，可能需要更优雅的错误处理方式
+        return 1;
     }
-    while((poll_result == 0) && ((cur_time_msec - start_time_msec) < MAX_POLL_CQ_TIMEOUT));
+    // 确认收到的CQ事件，避免内存泄漏
+    ibv_ack_cq_events(ev_cq, 1);
 
-    if(poll_result < 0)
-    {
-        /* poll CQ failed */
-        fprintf(stderr, "poll CQ failed\n");
-        rc = 1;
-    }
-    else if(poll_result == 0)
-    {
-        /* the CQ is empty */
-        fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
-        rc = 1;
-    }
-    else
-    {
-        /* CQE found */
-        //fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
-        /* check the completion status (here we don't care about the completion opcode */
-        if(wc.status != IBV_WC_SUCCESS)
-        {
-            fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", 
-					wc.status, wc.vendor_err);
-            rc = 1;
+    // 轮询CQ以获取工作完成状态
+    int poll_result = ibv_poll_cq(res->cq, 1, &wc);
+    if (poll_result < 0) {
+        // Poll CQ failed
+        return 1;
+    } else if (poll_result == 0) {
+        // Theoretically shouldn't happen after getting a CQ event
+        return 1;
+    } else {
+        // Check the completion status
+        if (wc.status != IBV_WC_SUCCESS) {
+            return 1;
         }
     }
-    return rc;
-}
 
+    return 0; // Success
+}
 /******************************************************************************
 * Function: post_send
 *
@@ -584,9 +550,17 @@ static int resources_create(struct resources *res)
         goto resources_create_exit;
     }
 
+    // 创建完成事件通道
+    res->comp_channel = ibv_create_comp_channel(res->ib_ctx);
+    if (!res->comp_channel) {
+        fprintf(stderr, "Failed to create completion event channel\n");
+        // 错误处理
+        return -1;
+    }
+
     /* each side will send only one WR, so Completion Queue with 1 entry is enough */
     cq_size = 1;
-    res->cq = ibv_create_cq(res->ib_ctx, cq_size, NULL, NULL, 0);
+    res->cq = ibv_create_cq(res->ib_ctx, cq_size, NULL, res->comp_channel, 0);
     if(!res->cq)
     {
         fprintf(stderr, "failed to create CQ with %u entries\n", cq_size);
@@ -645,7 +619,11 @@ static int resources_create(struct resources *res)
         rc = 1;
         goto resources_create_exit;
     }
+
+
     fprintf(stdout, "QP was created, QP number=0x%x\n", res->qp->qp_num);
+
+
 
 resources_create_exit:
     if(rc)
@@ -1095,7 +1073,8 @@ int main(int argc, char *argv[])
     struct resources res;
     int rc = 1;
     char temp_char;
-
+    pid_t pid = getpid(); // 获取当前进程号
+    printf("Current process ID: %d\n", pid); // 打印当前进程号
     /* parse the command line parameters */
     while(1)
     {
@@ -1178,32 +1157,15 @@ int main(int argc, char *argv[])
         goto main_exit;
     }
 
-    // for(int i=1;i<=1;i++){
-    //     if(poll_completion(&res))
-    //     {
-    //         fprintf(stderr, "poll completion failed\n");
-    //         goto main_exit;
-    //     }
-    //     fprintf(stdout, "Message is: '%s'\n", res.buf);
-    //     //接收成功，处理数据
-    //     if(i==100){
-    //         break;
-    //     }
-    //     rc = post_receive(&res);
-    //     if(rc)
-    //     {
-    //         fprintf(stderr, "failed to post RR\n");
-    //     }
-    // }
-    
-    /* after polling the completion we have the message in the client buffer too */
-
-    
-
     /* Sync so we are sure server side has data ready before client tries to read it */
 
     //开始读取
     while(1){
+        // 请求CQ通知，第二个参数为0表示在任何新的完成项到达时生成事件
+        if (ibv_req_notify_cq(res.cq, 0)) {
+            fprintf(stderr, "Couldn't request CQ notification\n");
+            return 1;
+        }
         if(sock_sync_data(res.sock, 1, "R", &temp_char))  /* just send a dummy char back and forth */
         {
             fprintf(stderr, "sync error before RDMA ops\n");
@@ -1228,64 +1190,8 @@ int main(int argc, char *argv[])
         if(temp_char=='R'){
             //完成
             break;
-        }else if(temp_char=='r'){
-            //继续
-            
         }
     }
-    // if(sock_sync_data(res.sock, 1, "R", &temp_char))  /* just send a dummy char back and forth */
-    // {
-    //     fprintf(stderr, "sync error before RDMA ops\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-
-
-    // /* 
-	//  * Now the client performs an RDMA read and then write on server.
-	//  * Note that the server has no idea these events have occured 
-	//  */
-
-    // /* First we read contens of server's buffer */
-    // if(post_send(&res, IBV_WR_RDMA_READ))
-    // {
-    //     fprintf(stderr, "failed to post SR 2\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-    // if(poll_completion(&res))
-    // {
-    //     fprintf(stderr, "poll completion failed 2\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-    // fprintf(stdout, "Contents of server's buffer: '%s'\n", res.buf);
-
-    // /* Now we replace what's in the server's buffer */
-    // strcpy(res.buf, RDMAMSGW);
-    // fprintf(stdout, "Now replacing it with: '%s'\n", res.buf);
-    // if(post_send(&res, IBV_WR_RDMA_WRITE))
-    // {
-    //     fprintf(stderr, "failed to post SR 3\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-    // if(poll_completion(&res))
-    // {
-    //     fprintf(stderr, "poll completion failed 3\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-
-
-    // /* Sync so server will know that client is done mucking with its memory */
-    // if(sock_sync_data(res.sock, 1, "W", &temp_char))  /* just send a dummy char back and forth */
-    // {
-    //     fprintf(stderr, "sync error after RDMA ops\n");
-    //     rc = 1;
-    //     goto main_exit;
-    // }
-
     rc = 0;
 
 main_exit:

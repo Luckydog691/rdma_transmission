@@ -36,7 +36,7 @@
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
-#define MSG_SIZE 1024 * 128
+#define MSG_SIZE 128 * 1024
 //128K缓存
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 static inline uint64_t htonll(uint64_t x)
@@ -1064,11 +1064,15 @@ static void usage(const char *argv0)
     fprintf(stdout, " -g, --gid_idx <git index> gid index to be used in GRH (default not used)\n");
 }
 
+int gen_flag=1;
 void generate_data_to_buf(char *buffer){
-    for(int i = 0;i < MSG_SIZE - 1;i++){
-        buffer[i] = 'f';
+    if(gen_flag){
+        for(int i = 0;i < MSG_SIZE - 1;i++){
+            buffer[i] = 'f';
+        }
+        buffer[MSG_SIZE - 1] = '\0';
     }
-    buffer[MSG_SIZE - 1] = '\0';
+    gen_flag=0;
 }
 
 // 修改后的函数：从文件的指定偏移量开始读取数据到指定的缓冲区
@@ -1137,7 +1141,8 @@ int main(int argc, char *argv[])
     struct resources res;
     int rc = 1;
     char temp_char;
-
+    pid_t pid = getpid(); // 获取当前进程号
+    printf("Current process ID: %d\n", pid); // 打印当前进程号
     /* parse the command line parameters */
     while(1)
     {
@@ -1227,11 +1232,13 @@ int main(int argc, char *argv[])
     //开始断点传输文件
 
 
-    long long total_data_size = (long long)10 * 1024 * 1024 * 1024;
-
+    long long total_data_size = (long long)50 * 1024 * 1024 * 1024;
+    //long long total_data_size = 1206202395;
     long long data_size = MSG_SIZE;
     long long offset = 0;
     int count = 0;
+
+    //文件size: 
     while(1){
         ++count;
         if(count%10000==0){
